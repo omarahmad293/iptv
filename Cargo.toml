@@ -1,0 +1,21 @@
+﻿[package]
+name = "iptv-player"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "clipboard", "system_fonts"] }
+egui = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["http", "image", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+flate2 = "1.1"
+libloading = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
