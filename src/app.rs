@@ -69,14 +69,42 @@ pub struct VideoTex {
     pub h: i32,
 }
 
+pub const MAX_SLOTS: usize = 4;
+
+/// One independent player (own mpv instance, render target and playback state).
+pub struct Slot {
+    pub mpv: Option<Mpv>,
+    pub video: Option<VideoTex>,
+    pub force_render: bool,
+    pub current: Option<Playing>,
+    pub stats: Stats,
+    pub status: String,
+    pub last_stats: std::time::Instant,
+}
+
+impl Slot {
+    fn new(mpv: Option<Mpv>) -> Slot {
+        Slot { mpv, video: None, force_render: true, current: None, stats: Stats::default(), status: String::new(), last_stats: std::time::Instant::now() }
+    }
+}
+
+fn new_mpv(pa: &crate::mpv::ProcAddr, ctx: &egui::Context, volume: f64, mute: bool) -> Result<Mpv, String> {
+    let wake_ctx = ctx.clone();
+    let m = Mpv::new(&mpv_dll(), pa.clone(), Box::new(move || wake_ctx.request_repaint()))?;
+    m.set("volume", &format!("{volume}"));
+    m.set("mute", if mute { "yes" } else { "no" });
+    Ok(m)
+}
+
 pub struct App {
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
     pub ctx: egui::Context,
-    pub mpv: Option<Mpv>,
+    pub proc_addr: Option<crate::mpv::ProcAddr>,
+    pub slots: Vec<Slot>,
+    pub active: usize,
+    pub multi: bool,
     pub mpv_err: Option<String>,
-    pub video: Option<VideoTex>,
-    pub force_render: bool,
 
     pub settings: Settings,
     pub src: Source,
@@ -98,11 +126,7 @@ pub struct App {
     pub short_epg: HashMap<u64, Vec<Prog>>,
     pub short_pending: HashSet<u64>,
 
-    pub current: Option<Playing>,
     pub series: Option<SeriesView>,
-    pub stats: Stats,
-    pub status: String,
-    pub last_stats: std::time::Instant,
 
     pub show_settings: bool,
     pub form: Source,
@@ -128,30 +152,25 @@ impl App {
         let (tx, rx) = channel();
         let ctx = cc.egui_ctx.clone();
         let settings: Settings = cache_read::<Settings>("settings").map(|x| x.1).unwrap_or_default();
-        let (mpv, mpv_err) = match cc.get_proc_address.clone() {
-            Some(pa) => {
-                let wake_ctx = ctx.clone();
-                let pa2: crate::mpv::ProcAddr = Arc::new(move |name| pa(name));
-                match Mpv::new(&mpv_dll(), pa2, Box::new(move || wake_ctx.request_repaint())) {
-                    Ok(m) => (Some(m), None),
-                    Err(e) => (None, Some(e)),
-                }
-            }
+        let volume = settings.volume.unwrap_or(100.0);
+        let proc_addr: Option<crate::mpv::ProcAddr> = cc.get_proc_address.clone().map(|pa| Arc::new(move |name: &std::ffi::CStr| pa(name)) as crate::mpv::ProcAddr);
+        let (mpv, mpv_err) = match &proc_addr {
+            Some(pa) => match new_mpv(pa, &ctx, volume, false) {
+                Ok(m) => (Some(m), None),
+                Err(e) => (None, Some(e)),
+            },
             None => (None, Some("OpenGL context unavailable".to_string())),
         };
-        let volume = settings.volume.unwrap_or(100.0);
-        if let Some(m) = &mpv {
-            m.set("volume", &format!("{volume}"));
-        }
         let src = settings.source.clone();
         let mut app = App {
             tx,
             rx,
             ctx,
-            mpv,
+            proc_addr,
+            slots: vec![Slot::new(mpv)],
+            active: 0,
+            multi: false,
             mpv_err,
-            video: None,
-            force_render: true,
             favs: settings.favs.iter().cloned().collect(),
             recent: settings.recent.clone(),
             form: src.clone(),
@@ -171,11 +190,7 @@ impl App {
             epg: Epg::default(),
             short_epg: HashMap::new(),
             short_pending: HashSet::new(),
-            current: None,
             series: None,
-            stats: Stats::default(),
-            status: String::new(),
-            last_stats: std::time::Instant::now(),
             show_settings: false,
             form_msg: String::new(),
             form_busy: false,
@@ -382,7 +397,7 @@ impl App {
                         }
                     }
                 }
-                Msg::Note(n) => self.status = n,
+                Msg::Note(n) => self.slots[self.active].status = n,
             }
         }
     }
@@ -477,11 +492,12 @@ impl App {
             Some(eps) => eps[ep_idx].url.clone(),
             None => item.url.clone(),
         };
-        if let Some(m) = &self.mpv {
+        let a = self.active;
+        if let Some(m) = &self.slots[a].mpv {
             m.load(&url);
         }
-        self.status = "Loading…".into();
-        self.stats = Stats::default();
+        self.slots[a].status = "Loading…".into();
+        self.slots[a].stats = Stats::default();
         let key = item.key();
         self.recent.retain(|k| k != &key);
         self.recent.insert(0, key);
@@ -494,7 +510,7 @@ impl App {
                 ctx.request_repaint();
             });
         }
-        self.current = Some(Playing { item, kind, episodes, ep_idx, title, retried: false });
+        self.slots[a].current = Some(Playing { item, kind, episodes, ep_idx, title, retried: false });
         self.save_settings();
         self.ctx.request_repaint();
     }
@@ -508,9 +524,13 @@ impl App {
         }
     }
 
+    pub fn cur(&self) -> &Slot {
+        &self.slots[self.active]
+    }
+
     /// Step to previous/next channel in the current list, or episode in a series.
     pub fn step(&mut self, d: i32) {
-        if let Some(cur) = &self.current {
+        if let Some(cur) = &self.slots[self.active].current {
             if let Some(eps) = &cur.episodes {
                 let j = cur.ep_idx as i32 + d;
                 if j >= 0 && (j as usize) < eps.len() {
@@ -524,7 +544,7 @@ impl App {
             return;
         }
         let lib = self.libs[self.kind.idx()].clone();
-        let cur_url = self.current.as_ref().map(|c| c.item.url.clone());
+        let cur_url = self.cur().current.as_ref().map(|c| c.item.url.clone());
         let pos = cur_url.and_then(|u| self.view.iter().position(|&i| lib[i as usize].url == u));
         let n = self.view.len() as i32;
         let next = match pos {
@@ -539,17 +559,74 @@ impl App {
     }
 
     pub fn stop(&mut self) {
-        if let Some(m) = &self.mpv {
+        let s = &mut self.slots[self.active];
+        if let Some(m) = &s.mpv {
             m.stop();
         }
-        self.current = None;
-        self.status.clear();
-        self.stats = Stats::default();
+        s.current = None;
+        s.status.clear();
+        s.stats = Stats::default();
     }
 
-    /// Poll mpv for state and events. Cheap; called every frame.
+    /// Enter or leave multi-view (several streams side by side).
+    pub fn set_multi(&mut self, on: bool) {
+        if on == self.multi {
+            return;
+        }
+        if on {
+            let Some(pa) = self.proc_addr.clone() else { return };
+            while self.slots.len() < MAX_SLOTS {
+                match new_mpv(&pa, &self.ctx, self.volume, true) {
+                    Ok(m) => self.slots.push(Slot::new(Some(m))),
+                    Err(e) => {
+                        self.mpv_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            self.multi = true;
+        } else {
+            let keep = self.slots.swap_remove(self.active);
+            self.slots.clear();
+            self.slots.push(keep);
+            self.active = 0;
+            self.multi = false;
+        }
+        self.apply_audio();
+        self.force_all_render();
+    }
+
+    pub fn force_all_render(&mut self) {
+        for s in &mut self.slots {
+            s.force_render = true;
+        }
+    }
+
+    pub fn set_active(&mut self, i: usize) {
+        if i < self.slots.len() && i != self.active {
+            self.active = i;
+            self.apply_audio();
+        }
+    }
+
+    /// Only the active player is audible.
+    pub fn apply_audio(&mut self) {
+        for (i, s) in self.slots.iter().enumerate() {
+            if let Some(m) = &s.mpv {
+                m.set("mute", if i == self.active && !self.muted { "no" } else { "yes" });
+            }
+        }
+    }
+
+    pub fn stop_slot(&mut self, i: usize) {
+        let prev = std::mem::replace(&mut self.active, i);
+        self.stop();
+        self.active = prev;
+    }
+
+    /// Poll mpv for state and events on every player. Cheap; called every frame.
     pub fn poll_player(&mut self) {
-        if self.current.is_none() && self.loaded[0] {
+        if self.slots[0].current.is_none() && self.loaded[0] {
             if let Ok(q) = std::env::var("IPTV_AUTOPLAY") {
                 let lib = self.libs[0].clone();
                 if let Some(it) = lib.iter().find(|i| i.lc.contains(&q.to_lowercase())) {
@@ -557,84 +634,82 @@ impl App {
                 }
             }
         }
-        let Some(m) = &self.mpv else { return };
-        let mut ended = false;
-        let mut failed: Option<String> = None;
-        for e in m.poll_events() {
-            match e {
-                Event_::Loaded => self.status.clear(),
-                Event_::Ended => ended = true,
-                Event_::Failed(s) => failed = Some(s),
-            }
-        }
-        if self.current.is_some() && self.last_stats.elapsed().as_millis() > 100 {
-            self.last_stats = std::time::Instant::now();
-            let paused = m.get_bool("pause").unwrap_or(false);
-            self.stats = Stats {
-                pos: m.get_f64("time-pos").unwrap_or(0.0),
-                dur: m.get_f64("duration").unwrap_or(0.0),
-                paused,
-                buffering: m.get_bool("paused-for-cache").unwrap_or(false) || (!paused && m.get_bool("core-idle").unwrap_or(false)),
-                w: m.get_i64("video-params/w").unwrap_or(0),
-                h: m.get_i64("video-params/h").unwrap_or(0),
-            };
-            if self.stats.w > 0 && self.status == "Loading…" {
-                self.status.clear();
-            }
-        }
-        if ended {
-            if let Some(c) = &self.current {
-                if c.episodes.is_some() {
-                    self.step(1);
+        for i in 0..self.slots.len() {
+            let s = &mut self.slots[i];
+            let Some(m) = &s.mpv else { continue };
+            let mut ended = false;
+            let mut failed: Option<String> = None;
+            for e in m.poll_events() {
+                match e {
+                    Event_::Loaded => s.status.clear(),
+                    Event_::Ended => ended = true,
+                    Event_::Failed(e) => failed = Some(e),
                 }
             }
-        }
-        if let Some(err) = failed {
-            let retry = self.current.as_mut().filter(|c| !c.retried && c.kind == Kind::Live).map(|c| {
-                c.retried = true;
-                c.item.url.clone()
-            });
-            match retry {
-                Some(u) => {
-                    if let Some(m) = &self.mpv {
-                        m.load(&u);
-                    }
+            if s.current.is_some() && s.last_stats.elapsed().as_millis() > 100 {
+                s.last_stats = std::time::Instant::now();
+                let paused = m.get_bool("pause").unwrap_or(false);
+                s.stats = Stats {
+                    pos: m.get_f64("time-pos").unwrap_or(0.0),
+                    dur: m.get_f64("duration").unwrap_or(0.0),
+                    paused,
+                    buffering: m.get_bool("paused-for-cache").unwrap_or(false) || (!paused && m.get_bool("core-idle").unwrap_or(false)),
+                    w: m.get_i64("video-params/w").unwrap_or(0),
+                    h: m.get_i64("video-params/h").unwrap_or(0),
+                };
+                if s.stats.w > 0 && s.status == "Loading…" {
+                    s.status.clear();
                 }
-                None => self.status = format!("Cannot play this stream ({err})"),
+            }
+            if ended && s.current.as_ref().map(|c| c.episodes.is_some()).unwrap_or(false) {
+                let prev = std::mem::replace(&mut self.active, i);
+                self.step(1);
+                self.active = prev;
+                continue;
+            }
+            if let Some(err) = failed {
+                let retry = s.current.as_mut().filter(|c| !c.retried && c.kind == Kind::Live).map(|c| {
+                    c.retried = true;
+                    c.item.url.clone()
+                });
+                match (retry, &s.mpv) {
+                    (Some(u), Some(m)) => m.load(&u),
+                    _ => s.status = format!("Cannot play this stream ({err})"),
+                }
             }
         }
     }
 
     pub fn is_vod(&self) -> bool {
-        self.current.as_ref().map(|c| c.kind != Kind::Live).unwrap_or(false)
+        self.cur().current.as_ref().map(|c| c.kind != Kind::Live).unwrap_or(false)
     }
 
     pub fn toggle_pause(&mut self) {
-        if let Some(m) = &self.mpv {
+        if let Some(m) = &self.cur().mpv {
             m.command(&["cycle", "pause"]);
         }
     }
     pub fn seek_rel(&mut self, secs: f64) {
-        if let Some(m) = &self.mpv {
+        if let Some(m) = &self.cur().mpv {
             m.command(&["seek", &secs.to_string(), "relative"]);
         }
     }
     pub fn seek_abs(&mut self, secs: f64) {
-        if let Some(m) = &self.mpv {
+        if let Some(m) = &self.cur().mpv {
             m.command(&["seek", &secs.to_string(), "absolute"]);
         }
     }
     pub fn set_volume(&mut self, v: f64) {
         self.volume = v.clamp(0.0, 130.0);
-        if let Some(m) = &self.mpv {
-            m.set("volume", &self.volume.to_string());
+        for s in &self.slots {
+            if let Some(m) = &s.mpv {
+                m.set("volume", &self.volume.to_string());
+            }
         }
     }
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
-        if let Some(m) = &self.mpv {
-            m.set("mute", if self.muted { "yes" } else { "no" });
-        }
+        self.apply_audio();
     }
 
     /* ---------------- EPG lookups ---------------- */
@@ -675,13 +750,14 @@ impl App {
     /* ---------------- video texture ---------------- */
 
     /// Render the current mpv frame into an offscreen texture sized to the video area.
-    pub fn render_video(&mut self, frame: &mut eframe::Frame, px_w: i32, px_h: i32) -> Option<egui::TextureId> {
+    pub fn render_video(&mut self, slot: usize, frame: &mut eframe::Frame, px_w: i32, px_h: i32) -> Option<egui::TextureId> {
         let gl = frame.gl()?.clone();
         let (px_w, px_h) = (px_w.max(16), px_h.max(16));
-        let needs_new = self.video.as_ref().map(|v| v.w != px_w || v.h != px_h).unwrap_or(true);
+        let s = &mut self.slots[slot];
+        let needs_new = s.video.as_ref().map(|v| v.w != px_w || v.h != px_h).unwrap_or(true);
         if needs_new {
             unsafe {
-                if let Some(old) = self.video.take() {
+                if let Some(old) = s.video.take() {
                     gl.delete_framebuffer(old.fbo);
                     gl.delete_texture(old.tex);
                 }
@@ -697,19 +773,19 @@ impl App {
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 let id = frame.register_native_glow_texture(tex);
-                self.video = Some(VideoTex { fbo, tex, id, w: px_w, h: px_h });
+                s.video = Some(VideoTex { fbo, tex, id, w: px_w, h: px_h });
             }
-            self.force_render = true;
+            s.force_render = true;
         }
-        let v = self.video.as_ref()?;
-        if let Some(m) = &self.mpv {
+        let v = s.video.as_ref()?;
+        if let Some(m) = &s.mpv {
             use glow::NativeFramebuffer;
             let fbo_id: u32 = {
                 let NativeFramebuffer(n) = v.fbo;
                 n.get()
             };
-            if m.render(fbo_id, v.w, v.h, self.force_render) {
-                self.force_render = false;
+            if m.render(fbo_id, v.w, v.h, s.force_render) {
+                s.force_render = false;
             }
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);

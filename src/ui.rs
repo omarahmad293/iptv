@@ -74,6 +74,14 @@ fn tz_offset_secs() -> i64 {
     })
 }
 
+fn tile_rects(r: egui::Rect, n: usize) -> Vec<egui::Rect> {
+    let cols = if n <= 1 { 1 } else if n <= 4 { 2 } else { 3 };
+    let rows = n.div_ceil(cols);
+    let gap = 2.0;
+    let (w, h) = ((r.width() - gap * (cols - 1) as f32) / cols as f32, (r.height() - gap * (rows - 1) as f32) / rows as f32);
+    (0..n).map(|i| egui::Rect::from_min_size(r.min + Vec2::new((i % cols) as f32 * (w + gap), (i / cols) as f32 * (h + gap)), Vec2::new(w, h))).collect()
+}
+
 fn res_label(w: i64, h: i64) -> String {
     let q = if h >= 2000 || w >= 3600 { "4K" } else if h >= 1400 { "QHD" } else if h >= 1000 || w >= 1800 { "FHD" } else if h >= 700 { "HD" } else { "SD" };
     format!("{q} · {w}×{h}")
@@ -83,11 +91,16 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
         self.poll_player();
-        if self.current.is_some() {
+        if self.slots.iter().any(|s| s.current.is_some()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let typing = ctx.egui_wants_keyboard_input();
         if !typing && !self.show_settings {
+            if self.multi {
+                for (n, k) in [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4].into_iter().enumerate() {
+                    if ctx.input(|i| i.key_pressed(k)) { self.set_active(n); }
+                }
+            }
             let (space, enter, f, m, l, r, u, d, slash, esc) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::Space),
@@ -108,7 +121,7 @@ impl eframe::App for App {
             if esc && self.fullscreen { self.toggle_fullscreen(ctx); }
             if m { self.toggle_mute(); }
             if f {
-                if let Some(c) = self.current.as_ref().map(|c| c.item.clone()) { self.toggle_fav(&c); }
+                if let Some(c) = self.cur().current.as_ref().map(|c| c.item.clone()) { self.toggle_fav(&c); }
             }
             if l { if vod { self.seek_rel(-10.0) } else { self.set_volume(self.volume - 5.0) } }
             if r { if vod { self.seek_rel(10.0) } else { self.set_volume(self.volume + 5.0) } }
@@ -141,6 +154,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Source settings").clicked() { self.show_settings = true; }
                 if ui.button("⟳").on_hover_text("Refresh list").clicked() { let k = self.kind; self.refresh(k); }
+                if ui.selectable_label(self.multi, "⊞ Multi").on_hover_text("Watch up to 4 streams at once (keys 1-4 select a tile)").clicked() { let m = !self.multi; self.set_multi(m); }
             });
         });
         ui.add_space(4.0);
@@ -190,7 +204,7 @@ impl App {
         let row_h = 52.0;
         let lib = self.libs[self.kind.idx()].clone();
         let now = now_ms();
-        let cur_url = self.current.as_ref().map(|c| c.item.url.clone());
+        let cur_urls: Vec<String> = self.slots.iter().filter_map(|s| s.current.as_ref().map(|c| c.item.url.clone())).collect();
         let mut open: Option<Item> = None;
         let mut fav: Option<Item> = None;
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
@@ -202,7 +216,7 @@ impl App {
             for r in range {
                 let Some(it) = view.get(r).and_then(|&i| lib.get(i as usize)) else { continue };
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), egui::Sense::click());
-                let playing = cur_url.as_deref() == Some(it.url.as_str());
+                let playing = cur_urls.iter().any(|u| u == &it.url);
                 let bg = if playing { Color32::from_rgb(38, 40, 80) } else if resp.hovered() { Color32::from_rgb(30, 34, 46) } else { Color32::TRANSPARENT };
                 ui.painter().rect_filled(rect, 8.0, bg);
                 let logo_rect = egui::Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::splat(40.0));
@@ -246,7 +260,7 @@ impl App {
             (_, Some(e)) => { ui.colored_label(Color32::from_rgb(240, 110, 110), e); }
             (None, _) => { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading episodes…"); }); }
             (Some(info), _) => {
-                let cur = self.current.as_ref().filter(|c| c.episodes.is_some() && c.item.series_id == sv.item.series_id).map(|c| c.ep_idx);
+                let cur = self.cur().current.as_ref().filter(|c| c.episodes.is_some() && c.item.series_id == sv.item.series_id).map(|c| c.ep_idx);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut last = String::new();
                     for (i, e) in info.episodes.iter().enumerate() {
@@ -266,40 +280,65 @@ impl App {
         let info_h = if self.fullscreen { 0.0 } else { 150.0f32.min(avail.height() * 0.3) };
         let video_rect = egui::Rect::from_min_size(avail.min, Vec2::new(avail.width(), avail.height() - info_h));
         let ppp = ui.ctx().pixels_per_point();
-        ui.painter().rect_filled(video_rect, 0.0, Color32::BLACK);
-
-        if self.current.is_some() {
-            let w = (video_rect.width() * ppp) as i32;
-            let h = (video_rect.height() * ppp) as i32;
-            if let Some(id) = self.render_video(frame, w, h) {
-                ui.painter().image(id, video_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        let n = if self.multi { self.slots.len() } else { 1 };
+        let tiles: Vec<egui::Rect> = if n == 1 { vec![video_rect] } else { tile_rects(video_rect, n) };
+        let mut close: Option<usize> = None;
+        for (i, &tr) in tiles.iter().enumerate() {
+            ui.painter().rect_filled(tr, 0.0, Color32::BLACK);
+            let has = self.slots[i].current.is_some();
+            if has {
+                if let Some(id) = self.render_video(i, frame, (tr.width() * ppp) as i32, (tr.height() * ppp) as i32) {
+                    ui.painter().image(id, tr, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                }
+            } else {
+                let msg = if let Some(e) = &self.mpv_err { format!("Player unavailable: {e}") } else if n > 1 { format!("Tile {} — pick a channel", i + 1) } else { "Select a channel to start watching".into() };
+                ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(if n > 1 { 14.0 } else { 18.0 }), MUTED);
             }
-        } else {
-            let msg = if let Some(e) = &self.mpv_err { format!("Player unavailable: {e}") } else { "Select a channel to start watching".into() };
-            ui.painter().text(video_rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(18.0), MUTED);
+
+            let resp = ui.interact(tr, ui.id().with(("video", i)), egui::Sense::click());
+            if resp.double_clicked() { let c = ui.ctx().clone(); self.toggle_fullscreen(&c); }
+            else if resp.clicked() {
+                if i == self.active { self.toggle_pause(); } else { self.set_active(i); }
+            }
+            if resp.hovered() && ui.input(|i| i.pointer.delta() != Vec2::ZERO) { self.last_mouse_move = std::time::Instant::now(); }
+
+            if has {
+                let s = &self.slots[i];
+                if s.stats.w > 0 {
+                    let t = res_label(s.stats.w, s.stats.h);
+                    let g = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), Color32::WHITE);
+                    let r = egui::Rect::from_min_size(tr.min + Vec2::new(12.0, 12.0), g.size() + Vec2::new(16.0, 8.0));
+                    ui.painter().rect_filled(r, 12.0, Color32::from_black_alpha(170));
+                    ui.painter().galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+                }
+                let status = if s.stats.buffering && s.status.is_empty() { "Buffering…".to_string() } else { s.status.clone() };
+                if !status.is_empty() {
+                    ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, status, egui::FontId::proportional(if n > 1 { 14.0 } else { 18.0 }), Color32::WHITE);
+                }
+            }
+            if n > 1 {
+                if let Some(c) = &self.slots[i].current {
+                    let g = ui.painter().layout(format!("{} · {}", i + 1, c.title), egui::FontId::proportional(12.0), Color32::WHITE, tr.width() - 80.0);
+                    let r = egui::Rect::from_min_size(egui::pos2(tr.min.x + 6.0, tr.max.y - g.size().y - 14.0), g.size() + Vec2::new(12.0, 8.0));
+                    ui.painter().rect_filled(r, 6.0, Color32::from_black_alpha(170));
+                    ui.painter().galley(r.min + Vec2::new(6.0, 4.0), g, Color32::WHITE);
+                    let xr = egui::Rect::from_min_size(egui::pos2(tr.max.x - 30.0, tr.min.y + 6.0), Vec2::splat(24.0));
+                    let xresp = ui.interact(xr, ui.id().with(("close", i)), egui::Sense::click());
+                    ui.painter().rect_filled(xr, 12.0, Color32::from_black_alpha(if xresp.hovered() { 220 } else { 150 }));
+                    ui.painter().text(xr.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(13.0), Color32::WHITE);
+                    if xresp.on_hover_text("Close stream").clicked() { close = Some(i); }
+                }
+                let col = if i == self.active { ACCENT } else { Color32::from_rgb(34, 38, 50) };
+                ui.painter().rect_stroke(tr, 0.0, egui::Stroke::new(if i == self.active { 2.0 } else { 1.0 }, col), egui::StrokeKind::Inside);
+            }
         }
+        if let Some(i) = close { self.stop_slot(i); }
 
-        let resp = ui.interact(video_rect, ui.id().with("video"), egui::Sense::click());
-        if resp.double_clicked() { let c = ui.ctx().clone(); self.toggle_fullscreen(&c); }
-        else if resp.clicked() { self.toggle_pause(); }
-        if resp.hovered() && ui.input(|i| i.pointer.delta() != Vec2::ZERO) { self.last_mouse_move = std::time::Instant::now(); }
-        let show_ctl = self.last_mouse_move.elapsed().as_secs_f32() < 3.0 || self.stats.paused || !self.fullscreen;
-        if self.current.is_some() && !show_ctl { ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::None); }
+        let any = self.slots.iter().any(|s| s.current.is_some());
+        let show_ctl = self.last_mouse_move.elapsed().as_secs_f32() < 3.0 || self.cur().stats.paused || !self.fullscreen;
+        if any && !show_ctl { ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::None); }
 
-        if self.current.is_some() {
-            if self.stats.w > 0 {
-                let t = res_label(self.stats.w, self.stats.h);
-                let g = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), Color32::WHITE);
-                let r = egui::Rect::from_min_size(video_rect.min + Vec2::new(12.0, 12.0), g.size() + Vec2::new(16.0, 8.0));
-                ui.painter().rect_filled(r, 12.0, Color32::from_black_alpha(170));
-                ui.painter().galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
-            }
-            let status = if self.stats.buffering && self.status.is_empty() { "Buffering…".to_string() } else { self.status.clone() };
-            if !status.is_empty() {
-                ui.painter().text(video_rect.center(), egui::Align2::CENTER_CENTER, status, egui::FontId::proportional(18.0), Color32::WHITE);
-            }
-            if show_ctl { self.controls(ui, video_rect); }
-        }
+        if self.cur().current.is_some() && show_ctl { self.controls(ui, video_rect); }
 
         if !self.fullscreen {
             let info = egui::Rect::from_min_max(egui::pos2(avail.min.x, video_rect.max.y), avail.max);
@@ -314,22 +353,23 @@ impl App {
         ui.painter().rect_filled(bar, 0.0, Color32::from_black_alpha(150));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(14.0, 8.0))));
         let ui = &mut child;
-        let vod = self.is_vod() && self.stats.dur > 0.5;
+        let vod = self.is_vod() && self.cur().stats.dur > 0.5;
         if vod {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(fmt_time(self.stats.pos)).monospace());
-                let mut p = self.stats.pos;
+                let (pos, dur) = (self.cur().stats.pos, self.cur().stats.dur);
+                ui.label(RichText::new(fmt_time(pos)).monospace());
+                let mut p = pos;
                 ui.spacing_mut().slider_width = (ui.available_width() - 90.0).max(50.0);
-                let s = egui::Slider::new(&mut p, 0.0..=self.stats.dur).show_value(false);
+                let s = egui::Slider::new(&mut p, 0.0..=dur).show_value(false);
                 let r = ui.add(s);
                 if r.drag_stopped() || (r.changed() && !r.dragged()) { self.seek_abs(p); }
-                ui.label(RichText::new(fmt_time(self.stats.dur)).monospace());
+                ui.label(RichText::new(fmt_time(dur)).monospace());
             });
         }
         ui.horizontal(|ui| {
             let big = |s: &str| RichText::new(s).size(18.0);
             if ui.button(big("⏮")).clicked() { self.step(-1); }
-            if ui.button(big(if self.stats.paused { "▶" } else { "⏸" })).clicked() { self.toggle_pause(); }
+            if ui.button(big(if self.cur().stats.paused { "▶" } else { "⏸" })).clicked() { self.toggle_pause(); }
             if ui.button(big("⏭")).clicked() { self.step(1); }
             if ui.button(big("⏹")).clicked() { self.stop(); }
             ui.separator();
@@ -339,7 +379,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let c = ui.ctx().clone();
                 if ui.button(RichText::new("Fullscreen").size(14.0)).on_hover_text("Fullscreen (Enter)").clicked() { self.toggle_fullscreen(&c); }
-                if let Some(it) = self.current.as_ref().map(|c| c.item.clone()) {
+                if let Some(it) = self.cur().current.as_ref().map(|c| c.item.clone()) {
                     let fav = self.favs.contains(&it.key());
                     if ui.button(big(if fav { "Unfavorite" } else { "Favorite" }).size(14.0)).clicked() { self.toggle_fav(&it); }
                 }
@@ -349,8 +389,8 @@ impl App {
     }
 
     fn info_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(cur) = &self.current else {
-            ui.label(RichText::new("Shortcuts:  / search · ↑↓ channel · Space pause · Enter fullscreen · F favorite · M mute · ←→ seek/volume").color(MUTED));
+        let Some(cur) = &self.slots[self.active].current else {
+            ui.label(RichText::new("Shortcuts:  / search · ↑↓ channel · Space pause · Enter fullscreen · F favorite · M mute · ←→ seek/volume · ⊞ Multi: 1-4 select tile").color(MUTED));
             return;
         };
         ui.label(RichText::new(&cur.title).size(18.0).strong());
