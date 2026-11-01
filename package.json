@@ -1,0 +1,26 @@
+{
+  "name": "iptv",
+  "version": "1.0.0",
+  "productName": "IPTV Player",
+  "description": "Fast, modern M3U/EPG IPTV player for Windows",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "local.iptv.player",
+    "files": ["src/**/*", "node_modules/hls.js/dist/hls.min.js", "node_modules/mpegts.js/dist/mpegts.js", "package.json"],
+    "win": { "target": "portable" }
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "hls.js": "^1.7.4",
+    "mpegts.js": "^1.8.2"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  }
+}

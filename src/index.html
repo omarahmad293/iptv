@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data: blob:; media-src * blob: data:; connect-src *; worker-src blob:">
+<title>IPTV Player</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand"><span class="logo">▶</span> IPTV</div>
+    <div id="kinds" class="kinds hidden">
+      <button data-k="live" class="active">Live</button><button data-k="movie">Movies</button><button data-k="series">Series</button>
+    </div>
+    <nav id="groups"></nav>
+    <div class="side-foot">
+      <button id="btnSettings" class="btn ghost">⚙ Sources</button>
+    </div>
+  </aside>
+
+  <section id="listPane">
+    <div class="search"><input id="search" type="search" placeholder="Search channels   ( / )" autocomplete="off" spellcheck="false"></div>
+    <div id="listMeta"></div>
+    <div id="list"><div id="spacer"></div></div>
+  </section>
+
+  <main id="stage">
+    <div id="player" class="player">
+      <video id="video" autoplay></video>
+      <div id="osdTop" class="osd top"><span id="osdTitle"></span><span id="osdNow"></span><span id="osdRes" class="badge hidden"></span></div>
+      <div id="status" class="status hidden"></div>
+      <div id="empty" class="empty"><div class="big">▶</div><div>Select a channel to start watching</div></div>
+      <div id="controls" class="osd bottom">
+        <button id="cPlay" title="Play/Pause (Space)">❚❚</button>
+        <button id="cPrev" title="Previous (↑ / PgUp)">⏮</button>
+        <button id="cNext" title="Next (↓ / PgDn)">⏭</button>
+        <button id="cMute" title="Mute (M)">🔊</button>
+        <input id="cVol" type="range" min="0" max="1" step="0.01" value="1">
+        <span id="cTime" class="time hidden"></span>
+        <input id="cSeek" class="seek hidden" type="range" min="0" max="1000" step="1" value="0">
+        <span class="grow"></span>
+        <button id="cFav" title="Favorite (F)">☆</button>
+        <button id="cPip" title="Picture in picture">⧉</button>
+        <button id="cFull" title="Fullscreen (Enter)">⛶</button>
+      </div>
+    </div>
+    <div id="info">
+      <div id="infoHead"></div>
+      <div id="epgList"></div>
+    </div>
+  </main>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="card">
+    <h2>Sources</h2>
+    <div class="tabs"><button id="tabX" class="btn primary">Xtream login</button><button id="tabM" class="btn">M3U / file</button></div>
+    <div id="boxX">
+      <label>Server URL</label>
+      <div class="row"><input id="inServer" placeholder="http://example.com:8080"></div>
+      <label>Username</label>
+      <div class="row"><input id="inUser" autocomplete="off"></div>
+      <label>Password</label>
+      <div class="row"><input id="inPass" type="password" autocomplete="off"></div>
+    </div>
+    <div id="boxM" class="hidden">
+    <label>Playlist (M3U URL or file path)</label>
+    <div class="row"><input id="inPlaylist" placeholder="https://example.com/playlist.m3u"><button id="browsePl" class="btn">Browse</button></div>
+    <label>EPG (XMLTV URL or file path, optional — auto-detected from playlist)</label>
+    <div class="row"><input id="inEpg" placeholder="https://example.com/epg.xml.gz"><button id="browseEpg" class="btn">Browse</button></div>
+        </div>    <div id="modalMsg" class="msg"></div>
+    <div class="row end">
+      <button id="mClose" class="btn ghost">Close</button>
+      <button id="mLoad" class="btn primary">Load</button>
+    </div>
+  </div>
+</div>
+
+<script src="../node_modules/hls.js/dist/hls.min.js"></script>
+<script src="../node_modules/mpegts.js/dist/mpegts.js"></script>
+<script src="renderer.js"></script>
+</body>
+</html>

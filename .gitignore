@@ -1,0 +1,34 @@
+# Node dependencies and Electron packaging output
+node_modules/
+/dist/
+/out/
+coverage/
+.cache/
+
+# Rust build output (keep Cargo.lock for reproducible application builds)
+target/
+
+# Rust project has its own Git repository and ignore rules
+/iptv-rs/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local environment files (keep shareable examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Editor and operating-system files
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
