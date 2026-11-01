@@ -1,21 +1,16 @@
-# Node dependencies and Electron packaging output
+# Local dependencies and caches
 node_modules/
-/dist/
-/out/
-coverage/
 .cache/
 
 # Rust build output (keep Cargo.lock for reproducible application builds)
 target/
 
-# Rust project has its own Git repository and ignore rules
-/iptv-rs/
+# Locally supplied mpv binaries; keep the public headers
+/libs/mpv/*.dll
+/libs/mpv/*.dll.a
 
 # Logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
 # Local environment files (keep shareable examples)
 .env
