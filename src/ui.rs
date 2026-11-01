@@ -168,20 +168,32 @@ impl App {
 
         let ki = self.kind.idx();
         let cur_label = match &self.group { Group::All => "All".to_string(), Group::Fav => "Favorites".into(), Group::Recent => "Recent".into(), Group::Named(n) => n.clone() };
-        let mut new_group = None;
-        egui::ComboBox::from_id_salt("grp").width(ui.available_width()).selected_text(cur_label).show_ui(ui, |ui| {
-            ui.selectable_value(&mut new_group, Some(Group::All), "All");
-            ui.selectable_value(&mut new_group,             Some(Group::Fav), "Favorites");
-                        ui.selectable_value(&mut new_group, Some(Group::Recent), "Recent");
-            ui.separator();
-            egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+        let show_cats = self.browsing && self.query.trim().is_empty() && self.series.is_none();
+        if show_cats {
+            ui.add_space(2.0);
+            if self.loading[ki] && self.groups[ki].is_empty() {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Loading…"); });
+            } else if let Some(e) = self.lib_err[ki].clone() {
+                ui.colored_label(Color32::from_rgb(240, 110, 110), e);
+            }
+            let mut pick: Option<Group> = None;
+            let total = self.libs[ki].len();
+            ui.label(RichText::new("Categories").small().color(MUTED));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let mut row = |ui: &mut egui::Ui, g: Group, label: String| {
+                    if ui.add_sized([ui.available_width(), 32.0], egui::Button::new(label).fill(Color32::from_rgb(26, 30, 42))).clicked() { pick = Some(g); }
+                };
+                row(ui, Group::All, format!("All  ({total})"));
+                row(ui, Group::Fav, "★ Favorites".into());
+                row(ui, Group::Recent, "Recent".into());
                 for (g, n) in &self.groups[ki] {
-                    ui.selectable_value(&mut new_group, Some(Group::Named(g.clone())), format!("{g}  ({n})"));
+                    row(ui, Group::Named(g.clone()), format!("{g}  ({n})"));
                 }
             });
-        });
-        if let Some(g) = new_group { if g != self.group { self.group = g; self.view_dirty = true; } }
-
+            if let Some(g) = pick { self.group = g; self.browsing = false; self.view_dirty = true; }
+            return;
+        }
+        if self.series.is_none() && ui.button(format!("← Categories  ·  {cur_label}")).clicked() { self.browsing = true; return; }
         ui.add_space(2.0);
         if self.loading[ki] && self.view.is_empty() {
             ui.horizontal(|ui| { ui.spinner(); ui.label("Loading…"); });
@@ -393,7 +405,13 @@ impl App {
             ui.label(RichText::new("Shortcuts:  / search · ↑↓ channel · Space pause · Enter fullscreen · F favorite · M mute · ←→ seek/volume · ⊞ Multi: 1-4 select tile").color(MUTED));
             return;
         };
-        ui.label(RichText::new(&cur.title).size(18.0).strong());
+        let st = &self.slots[self.active].stats;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&cur.title).size(18.0).strong());
+            if st.w > 0 {
+                ui.label(RichText::new(res_label(st.w, st.h)).color(ACCENT).strong());
+            }
+        });
         if cur.kind == Kind::Live {
             let item = cur.item.clone();
             if let Some(progs) = self.programs_for(&item) {

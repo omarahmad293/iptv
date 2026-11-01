@@ -117,6 +117,7 @@ pub struct App {
     pub lib_err: [Option<String>; 3],
     pub groups: [Vec<(String, usize)>; 3],
     pub kind: Kind,
+    pub browsing: bool,
     pub group: Group,
     pub query: String,
     pub view: Vec<u32>,
@@ -183,6 +184,7 @@ impl App {
             lib_err: [None, None, None],
             groups: [vec![], vec![], vec![]],
             kind: Kind::Live,
+            browsing: true,
             group: Group::All,
             query: String::new(),
             view: vec![],
@@ -354,6 +356,7 @@ impl App {
                     self.short_epg.clear();
                     self.series = None;
                     self.kind = Kind::Live;
+                    self.browsing = true;
                     self.view_dirty = true;
                     self.save_settings();
                     self.refresh(Kind::Live);
@@ -407,6 +410,7 @@ impl App {
             return;
         }
         self.kind = kind;
+        self.browsing = true;
         self.group = Group::All;
         self.query.clear();
         self.series = None;
