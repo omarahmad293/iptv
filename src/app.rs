@@ -23,6 +23,8 @@ pub enum Msg {
 #[derive(Serialize, Deserialize, Default)]
 pub struct Settings {
     pub source: Source,
+    #[serde(default)]
+    pub saved: Vec<Source>,
     pub favs: Vec<String>,
     pub recent: Vec<String>,
     pub volume: Option<f64>,
@@ -202,6 +204,7 @@ impl App {
             volume,
             muted: false,
         };
+        app.ensure_saved();
         app.load_caches();
         if app.src.xtream && app.src.server.is_empty() || (!app.src.xtream && app.src.playlist.is_empty()) {
             app.show_settings = true;
@@ -211,6 +214,16 @@ impl App {
 
     pub fn is_xtream(&self) -> bool {
         self.src.xtream && !self.src.server.is_empty()
+    }
+
+    /// Migrate the single legacy source into the saved list.
+    fn ensure_saved(&mut self) {
+        let s = &self.settings.source;
+        let has = (s.xtream && !s.server.is_empty()) || (!s.xtream && !s.playlist.is_empty());
+        if has && !self.settings.saved.contains(s) {
+            let s = s.clone();
+            self.settings.saved.push(s);
+        }
     }
 
     pub fn save_settings(&mut self) {
@@ -344,6 +357,11 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Connected { src } => {
+                    let same = |a: &Source| a.xtream == src.xtream && a.server == src.server && a.user == src.user && a.playlist == src.playlist;
+                    match self.settings.saved.iter().position(same) {
+                        Some(i) => self.settings.saved[i] = src.clone(),
+                        None => self.settings.saved.push(src.clone()),
+                    }
                     self.src = src.clone();
                     self.form = src.clone();
                     self.form_busy = false;

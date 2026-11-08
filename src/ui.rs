@@ -443,6 +443,28 @@ impl App {
                 ui.selectable_value(&mut self.form_xtream, false, "M3U playlist");
             });
             ui.add_space(6.0);
+            if !self.settings.saved.is_empty() {
+                ui.label(RichText::new("Saved sources").strong());
+                let mut use_idx = None;
+                let mut del_idx = None;
+                for (i, s) in self.settings.saved.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let label = if s.xtream { format!("{}@{}", s.user, s.server) } else { s.playlist.clone() };
+                        let active = *s == self.src;
+                        if ui.add_enabled(!self.form_busy, egui::Button::selectable(active, label)).clicked() { use_idx = Some(i); }
+                        if ui.small_button("🗑").on_hover_text("Delete").clicked() { del_idx = Some(i); }
+                    });
+                }
+                if let Some(i) = del_idx { self.settings.saved.remove(i); self.save_settings(); }
+                if let Some(i) = use_idx {
+                    let s = self.settings.saved[i].clone();
+                    self.form_xtream = s.xtream;
+                    self.form = s;
+                    self.connect();
+                }
+                ui.separator();
+                ui.label(RichText::new("Add / edit").strong());
+            }
             let w = f32::INFINITY;
             if self.form_xtream {
                 ui.label("Server URL");

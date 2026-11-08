@@ -117,15 +117,61 @@ struct CacheFile<T> {
     data: T,
 }
 
+/// Windows DPAPI: ties data (settings with credentials, library URLs) to the current user.
+mod dpapi {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Blob {
+        len: u32,
+        data: *mut u8,
+    }
+    #[link(name = "crypt32")]
+    unsafe extern "system" {
+        fn CryptProtectData(i: *const Blob, desc: *const u16, e: *const Blob, r: *mut c_void, p: *mut c_void, flags: u32, o: *mut Blob) -> i32;
+        fn CryptUnprotectData(i: *const Blob, desc: *mut *mut u16, e: *const Blob, r: *mut c_void, p: *mut c_void, flags: u32, o: *mut Blob) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(p: *mut c_void) -> *mut c_void;
+    }
+
+    fn take(out: Blob) -> Vec<u8> {
+        let v = unsafe { std::slice::from_raw_parts(out.data, out.len as usize).to_vec() };
+        unsafe { LocalFree(out.data as *mut c_void) };
+        v
+    }
+    pub fn protect(b: &[u8]) -> Option<Vec<u8>> {
+        let inp = Blob { len: b.len() as u32, data: b.as_ptr() as *mut u8 };
+        let mut out = Blob { len: 0, data: std::ptr::null_mut() };
+        let ok = unsafe { CryptProtectData(&inp, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), 1, &mut out) };
+        if ok != 0 { Some(take(out)) } else { None }
+    }
+    pub fn unprotect(b: &[u8]) -> Option<Vec<u8>> {
+        let inp = Blob { len: b.len() as u32, data: b.as_ptr() as *mut u8 };
+        let mut out = Blob { len: 0, data: std::ptr::null_mut() };
+        let ok = unsafe { CryptUnprotectData(&inp, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), 1, &mut out) };
+        if ok != 0 { Some(take(out)) } else { None }
+    }
+}
+
 pub fn cache_write<T: Serialize>(name: &str, data: &T) {
     let f = CacheFile { ts: now_ms(), data };
     if let Ok(s) = serde_json::to_vec(&f) {
-        let _ = std::fs::write(data_dir().join(format!("{name}.json")), s);
+        // Never fall back to plaintext: the files may contain credentials.
+        if let Some(enc) = dpapi::protect(&s) {
+            let _ = std::fs::write(data_dir().join(format!("{name}.bin")), enc);
+            let _ = std::fs::remove_file(data_dir().join(format!("{name}.json")));
+        }
     }
 }
 pub fn cache_read<T: for<'de> Deserialize<'de>>(name: &str) -> Option<(i64, T)> {
-    let b = std::fs::read(data_dir().join(format!("{name}.json"))).ok()?;
-    let f: CacheFile<T> = serde_json::from_slice(&b).ok()?;
+    let bytes = match std::fs::read(data_dir().join(format!("{name}.bin"))).ok().and_then(|b| dpapi::unprotect(&b)) {
+        Some(b) => b,
+        // Legacy plaintext file; replaced by an encrypted one on next write.
+        None => std::fs::read(data_dir().join(format!("{name}.json"))).ok()?,
+    };
+    let f: CacheFile<T> = serde_json::from_slice(&bytes).ok()?;
     Some((f.ts, f.data))
 }
 
