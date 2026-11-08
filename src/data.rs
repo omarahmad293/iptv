@@ -69,6 +69,8 @@ pub struct Source {
     pub epg: String,
 }
 
+// Fields below are filled from the provider APIs and kept for upcoming detail views.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Prog {
     pub start: i64,
@@ -83,6 +85,7 @@ pub struct Epg {
     pub names: HashMap<String, String>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Episode {
     pub season: String,
@@ -92,6 +95,7 @@ pub struct Episode {
     pub duration: String,
     pub url: String,
 }
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct SeriesInfo {
     pub plot: String,
@@ -582,4 +586,107 @@ pub fn load_m3u(src: &str) -> Result<M3u, String> {
 
 pub fn load_epg(src: &str) -> Result<Epg, String> {
     Ok(parse_xmltv(&read_source(src)?))
+}
+
+/* ---------------- search / parental helpers ---------------- */
+
+/// Whether a category name looks like adult content (used by the parental lock).
+pub fn is_adult(group: &str) -> bool {
+    let g = group.to_lowercase();
+    if g.contains("18+") || g.contains("+18") {
+        return true;
+    }
+    g.split(|c: char| !c.is_alphanumeric()).any(|w| matches!(w, "adult" | "adults" | "xxx" | "porn" | "porno" | "erotic" | "erotica" | "nsfw" | "sex"))
+}
+
+/// True if `needle`'s characters appear in `hay` in order (loose, typo-tolerant match).
+pub fn is_subsequence(hay: &str, needle: &str) -> bool {
+    let mut h = hay.chars();
+    needle.chars().all(|n| h.any(|c| c == n))
+}
+
+/// Lower is better: 0 = name starts with the first term, 1 = a word starts with it, 2 = anywhere.
+pub fn search_rank(lc: &str, terms: &[String]) -> u8 {
+    match terms.first() {
+        Some(t) if lc.starts_with(t.as_str()) => 0,
+        Some(t) if lc.contains(&format!(" {t}")) => 1,
+        _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m3u_parses_attributes_and_groups() {
+        let text = "#EXTM3U url-tvg=\"http://x/epg.xml\"\n#EXTINF:-1 tvg-id=\"bbc1\" tvg-logo=\"http://x/l.png\" group-title=\"News\",BBC One\nhttp://s/1\n#EXTGRP:Sport\n#EXTINF:-1,ESPN\nhttp://s/2\n";
+        let m = parse_m3u(text);
+        assert_eq!(m.epg_url, "http://x/epg.xml");
+        assert_eq!(m.items.len(), 2);
+        assert_eq!((m.items[0].name.as_str(), m.items[0].group.as_str(), m.items[0].epg_id.as_str()), ("BBC One", "News", "bbc1"));
+        assert_eq!(m.items[0].lc, "bbc one");
+        assert_eq!(m.items[1].group, "Sport");
+        assert_eq!(m.items[1].url, "http://s/2");
+    }
+
+    #[test]
+    fn m3u_without_extinf_uses_url_name() {
+        let m = parse_m3u("http://host/path/channel.ts\n");
+        assert_eq!(m.items[0].name, "channel.ts");
+        assert_eq!(m.items[0].group, "Uncategorized");
+    }
+
+    fn xmltv_stamp(ms: i64) -> String {
+        let secs = ms / 1000;
+        let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+        format!("{y:04}{m:02}{d:02}{:02}{:02}{:02} +0000", rem / 3600, rem / 60 % 60, rem % 60)
+    }
+
+    #[test]
+    fn xmltv_parses_programmes() {
+        // The parser only keeps programmes around "now", so build timestamps relative to it.
+        let start = now_ms() - 1800_000;
+        let (s, e) = (xmltv_stamp(start), xmltv_stamp(start + 3_600_000));
+        let xml = format!("<tv><channel id=\"a\"><display-name>Chan A</display-name></channel><programme start=\"{s}\" stop=\"{e}\" channel=\"a\"><title>Show</title><desc>Text</desc></programme></tv>");
+        let epg = parse_xmltv(&xml);
+        let p = &epg.programs["a"];
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].2, "Show");
+        assert_eq!(p[0].1 - p[0].0, 3_600_000);
+        assert_eq!(epg.names.get(&norm_name("Chan A")).map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn norm_name_strips_punctuation_and_case() {
+        assert_eq!(norm_name("BBC-One HD!"), "bbconehd");
+    }
+
+    #[test]
+    fn adult_detection_is_word_based() {
+        assert!(is_adult("Adult Movies"));
+        assert!(is_adult("XXX | Night"));
+        assert!(is_adult("Movies 18+"));
+        assert!(!is_adult("Essex News"));
+        assert!(!is_adult("Sports"));
+    }
+
+    #[test]
+    fn fuzzy_and_ranking() {
+        assert!(is_subsequence("discovery channel", "dscvry"));
+        assert!(!is_subsequence("cnn", "nnc"));
+        let t = vec!["news".to_string()];
+        assert_eq!(search_rank("news 24", &t), 0);
+        assert_eq!(search_rank("sky news", &t), 1);
+        assert_eq!(search_rank("breaking-news", &t), 2);
+    }
 }

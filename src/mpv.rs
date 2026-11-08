@@ -57,6 +57,28 @@ pub enum Event_ {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Track {
+    pub id: i64,
+    pub audio: bool,
+    pub lang: String,
+    pub title: String,
+    pub selected: bool,
+}
+
+impl Track {
+    pub fn label(&self) -> String {
+        let mut parts = vec![format!("#{}", self.id)];
+        if !self.lang.is_empty() {
+            parts.push(self.lang.clone());
+        }
+        if !self.title.is_empty() {
+            parts.push(self.title.clone());
+        }
+        parts.join(" · ")
+    }
+}
+
 struct Api {
     _lib: Library,
     create: unsafe extern "C" fn() -> Handle,
@@ -246,6 +268,25 @@ impl Mpv {
             (self.api.free)(p as *mut c_void);
             Some(s)
         }
+    }
+
+    pub fn tracks(&self) -> Vec<Track> {
+        let n = self.get_i64("track-list/count").unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..n {
+            let kind = self.get_string(&format!("track-list/{i}/type")).unwrap_or_default();
+            if kind != "audio" && kind != "sub" {
+                continue;
+            }
+            out.push(Track {
+                id: self.get_i64(&format!("track-list/{i}/id")).unwrap_or(0),
+                audio: kind == "audio",
+                lang: self.get_string(&format!("track-list/{i}/lang")).unwrap_or_default(),
+                title: self.get_string(&format!("track-list/{i}/title")).unwrap_or_default(),
+                selected: self.get_bool(&format!("track-list/{i}/selected")).unwrap_or(false),
+            });
+        }
+        out
     }
 
     pub fn poll_events(&self) -> Vec<Event_> {

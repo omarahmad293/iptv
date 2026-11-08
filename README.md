@@ -92,3 +92,16 @@ license and comply with its notice and source-distribution requirements.
   OpenGL render API, rather than a standalone player executable.
 - **An older DLL is still loading:** replace the copy beside the executable;
   it takes precedence over the copy in `libs/mpv/`.
+## Features
+
+- Live TV, movies and series (Xtream login or M3U playlist) with guide (EPG), favorites and recents.
+- Typo-tolerant, ranked search; type digits to jump to a channel number.
+- Multi-view (up to 4 streams), picture-in-picture, audio/subtitle tracks, aspect ratio, speed, hardware-decoding toggle.
+- Live streams auto-reconnect with backoff; movies and episodes resume where you left off.
+- Parental control: set a PIN in the source settings to hide adult categories at every launch.
+- Crash reports are appended to `%APPDATA%\IPTV Player Rust\crash.log`.
+
+## Tests and releases
+
+`cargo test --locked` runs the parser tests. CI runs them on every push; pushing a `v*` tag builds a zip with the exe and libmpv and publishes a GitHub release.
+

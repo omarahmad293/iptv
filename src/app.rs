@@ -1,6 +1,6 @@
 //! Application state and logic (no drawing).
 use crate::data::*;
-use crate::mpv::{Event_, Mpv};
+use crate::mpv::{Event_, Mpv, Track};
 use eframe::glow;
 use eframe::glow::HasContext;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 pub enum Msg {
     Connected { src: Source },
     ConnectFailed(String),
-    Library { kind: Kind, items: Vec<Item>, fresh: bool },
+    Library { kind: Kind, items: Vec<Item> },
+    Cached { epoch: u64, kind: Kind, data: Option<(i64, Vec<Item>)> },
+    CachedEpg { epoch: u64, data: Option<(i64, Epg)> },
     LibraryFailed { kind: Kind, err: String },
     Epg(Epg),
     ShortEpg { sid: u64, progs: Vec<Prog> },
@@ -28,6 +30,20 @@ pub struct Settings {
     pub favs: Vec<String>,
     pub recent: Vec<String>,
     pub volume: Option<f64>,
+    /// Window x, y, width, height in points.
+    #[serde(default)]
+    pub win: Option<[f32; 4]>,
+    #[serde(default)]
+    pub win_maximized: bool,
+    /// Hardware decoding; `None` means the default (on).
+    #[serde(default)]
+    pub hwdec: Option<bool>,
+    /// Parental-control PIN (the settings file is DPAPI-encrypted). Empty = no lock.
+    #[serde(default)]
+    pub pin: String,
+    /// Last playback position (seconds) per movie / episode URL.
+    #[serde(default)]
+    pub positions: HashMap<String, f64>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -44,8 +60,15 @@ pub struct Playing {
     pub episodes: Option<Arc<Vec<Episode>>>,
     pub ep_idx: usize,
     pub title: String,
-    pub retried: bool,
+    pub retries: u32,
+    pub retry_at: Option<std::time::Instant>,
 }
+
+pub const MAX_RETRIES: u32 = 5;
+
+/// (label, mpv video-aspect-override, panscan)
+pub const ASPECTS: [(&str, &str, &str); 5] = [("Auto", "-1", "0"), ("16:9", "16:9", "0"), ("4:3", "4:3", "0"), ("21:9", "21:9", "0"), ("Fill (crop)", "-1", "1")];
+pub const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 pub struct SeriesView {
     pub item: Item,
@@ -73,6 +96,26 @@ pub struct VideoTex {
 
 pub const MAX_SLOTS: usize = 4;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MultiLayout {
+    Grid,
+    Columns,
+    Rows,
+    Focus,
+}
+
+impl MultiLayout {
+    pub const ALL: [MultiLayout; 4] = [MultiLayout::Columns, MultiLayout::Rows, MultiLayout::Focus, MultiLayout::Grid];
+    pub fn label(self) -> &'static str {
+        match self {
+            MultiLayout::Grid => "Grid",
+            MultiLayout::Columns => "Side by side",
+            MultiLayout::Rows => "Stacked",
+            MultiLayout::Focus => "Focus",
+        }
+    }
+}
+
 /// One independent player (own mpv instance, render target and playback state).
 pub struct Slot {
     pub mpv: Option<Mpv>,
@@ -82,19 +125,22 @@ pub struct Slot {
     pub stats: Stats,
     pub status: String,
     pub last_stats: std::time::Instant,
+    pub tracks: Vec<Track>,
+    pub resume_to: Option<f64>,
 }
 
 impl Slot {
     fn new(mpv: Option<Mpv>) -> Slot {
-        Slot { mpv, video: None, force_render: true, current: None, stats: Stats::default(), status: String::new(), last_stats: std::time::Instant::now() }
+        Slot { mpv, video: None, force_render: true, current: None, stats: Stats::default(), status: String::new(), last_stats: std::time::Instant::now(), tracks: vec![], resume_to: None }
     }
 }
 
-fn new_mpv(pa: &crate::mpv::ProcAddr, ctx: &egui::Context, volume: f64, mute: bool) -> Result<Mpv, String> {
+fn new_mpv(pa: &crate::mpv::ProcAddr, ctx: &egui::Context, volume: f64, mute: bool, hwdec: bool) -> Result<Mpv, String> {
     let wake_ctx = ctx.clone();
     let m = Mpv::new(&mpv_dll(), pa.clone(), Box::new(move || wake_ctx.request_repaint()))?;
     m.set("volume", &format!("{volume}"));
     m.set("mute", if mute { "yes" } else { "no" });
+    m.set("hwdec", if hwdec { "auto-safe" } else { "no" });
     Ok(m)
 }
 
@@ -106,6 +152,9 @@ pub struct App {
     pub slots: Vec<Slot>,
     pub active: usize,
     pub multi: bool,
+    /// Number of tiles used in multi-view (2..=MAX_SLOTS).
+    pub multi_n: usize,
+    pub layout: MultiLayout,
     pub mpv_err: Option<String>,
 
     pub settings: Settings,
@@ -142,6 +191,37 @@ pub struct App {
     pub scroll_to: Option<usize>,
     pub volume: f64,
     pub muted: bool,
+
+    /// Bumped when the source changes so stale background cache loads are ignored.
+    pub epoch: u64,
+    pub hwdec: bool,
+    pub aspect: usize,
+    pub speed: f64,
+    pub pip: bool,
+    /// Whether the system is currently told to stay awake.
+    pub awake: bool,
+    /// Parental lock: adult categories are hidden while true.
+    pub locked: bool,
+    pub pin_input: String,
+    pub pin_msg: String,
+    /// Digits typed for direct channel-number entry.
+    pub chan_buf: String,
+    pub chan_at: std::time::Instant,
+}
+
+/// Ask Windows not to sleep or blank the screen (call from the UI thread; the flag is per-thread).
+pub fn set_keep_awake(on: bool) {
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+    const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadExecutionState(flags: u32) -> u32;
+    }
+    let flags = if on { ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS };
+    unsafe {
+        SetThreadExecutionState(flags);
+    }
 }
 
 pub fn mpv_dll() -> std::path::PathBuf {
@@ -156,9 +236,11 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let settings: Settings = cache_read::<Settings>("settings").map(|x| x.1).unwrap_or_default();
         let volume = settings.volume.unwrap_or(100.0);
+        let hwdec = settings.hwdec.unwrap_or(true);
+        let locked = !settings.pin.is_empty();
         let proc_addr: Option<crate::mpv::ProcAddr> = cc.get_proc_address.clone().map(|pa| Arc::new(move |name: &std::ffi::CStr| pa(name)) as crate::mpv::ProcAddr);
         let (mpv, mpv_err) = match &proc_addr {
-            Some(pa) => match new_mpv(pa, &ctx, volume, false) {
+            Some(pa) => match new_mpv(pa, &ctx, volume, false, hwdec) {
                 Ok(m) => (Some(m), None),
                 Err(e) => (None, Some(e)),
             },
@@ -173,6 +255,8 @@ impl App {
             slots: vec![Slot::new(mpv)],
             active: 0,
             multi: false,
+            multi_n: 2,
+            layout: MultiLayout::Columns,
             mpv_err,
             favs: settings.favs.iter().cloned().collect(),
             recent: settings.recent.clone(),
@@ -203,6 +287,17 @@ impl App {
             scroll_to: None,
             volume,
             muted: false,
+            epoch: 0,
+            hwdec,
+            aspect: 0,
+            speed: 1.0,
+            pip: false,
+            awake: false,
+            locked,
+            pin_input: String::new(),
+            pin_msg: String::new(),
+            chan_buf: String::new(),
+            chan_at: std::time::Instant::now(),
         };
         app.ensure_saved();
         app.load_caches();
@@ -210,6 +305,15 @@ impl App {
             app.show_settings = true;
         }
         app
+    }
+
+    /// Keep the display and system awake while a stream is actually playing.
+    pub fn update_awake(&mut self) {
+        let want = self.slots.iter().any(|s| s.current.is_some() && !s.stats.paused);
+        if want != self.awake {
+            self.awake = want;
+            set_keep_awake(want);
+        }
     }
 
     pub fn is_xtream(&self) -> bool {
@@ -231,29 +335,32 @@ impl App {
         self.settings.favs = self.favs.iter().cloned().collect();
         self.settings.recent = self.recent.clone();
         self.settings.volume = Some(self.volume);
+        self.settings.hwdec = Some(self.hwdec);
         cache_write("settings", &self.settings);
     }
 
+    fn has_source(&self) -> bool {
+        self.is_xtream() || (!self.src.xtream && !self.src.playlist.is_empty())
+    }
+
+    /// Read cached libraries and guide on background threads so startup never blocks on disk/JSON/DPAPI.
     fn load_caches(&mut self) {
         for k in Kind::ALL {
-            if let Some((ts, items)) = cache_read::<Vec<Item>>(&format!("lib-{}", k.slug())) {
-                let mut items = items;
-                items.iter_mut().for_each(|i| i.prepare());
-                self.set_library(k, items);
-                if now_ms() - ts > 12 * 3600_000 && k == Kind::Live && (self.is_xtream() || !self.src.playlist.is_empty()) {
-                    self.refresh(k);
-                }
-            }
+            let (tx, ctx, epoch) = (self.tx.clone(), self.ctx.clone(), self.epoch);
+            std::thread::spawn(move || {
+                let data = cache_read::<Vec<Item>>(&format!("lib-{}", k.slug())).map(|(ts, mut items)| {
+                    items.iter_mut().for_each(|i| i.prepare());
+                    (ts, items)
+                });
+                let _ = tx.send(Msg::Cached { epoch, kind: k, data });
+                ctx.request_repaint();
+            });
         }
-        if let Some((ts, epg)) = cache_read::<Epg>("epg") {
-            self.epg = epg;
-            if now_ms() - ts > 12 * 3600_000 && !self.src.epg.is_empty() {
-                self.load_epg_url(self.src.epg.clone());
-            }
-        }
-        if !self.loaded[0] && (self.is_xtream() || !self.src.playlist.is_empty()) {
-            self.refresh(Kind::Live);
-        }
+        let (tx, ctx, epoch) = (self.tx.clone(), self.ctx.clone(), self.epoch);
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::CachedEpg { epoch, data: cache_read::<Epg>("epg") });
+            ctx.request_repaint();
+        });
     }
 
     pub fn set_library(&mut self, kind: Kind, items: Vec<Item>) {
@@ -285,7 +392,10 @@ impl App {
         std::thread::spawn(move || {
             let msg = if src.xtream {
                 match xtream_library(&src.server, &src.user, &src.pass, kind) {
-                    Ok(items) => Msg::Library { kind, items, fresh: true },
+                    Ok(items) => {
+                        cache_write(&format!("lib-{}", kind.slug()), &items);
+                        Msg::Library { kind, items }
+                    }
                     Err(err) => Msg::LibraryFailed { kind, err },
                 }
             } else if kind == Kind::Live {
@@ -293,10 +403,12 @@ impl App {
                     Ok(m) => {
                         if src.epg.is_empty() && !m.epg_url.is_empty() {
                             if let Ok(e) = load_epg(&m.epg_url) {
+                                cache_write("epg", &e);
                                 let _ = tx.send(Msg::Epg(e));
                             }
                         }
-                        Msg::Library { kind, items: m.items, fresh: true }
+                        cache_write(&format!("lib-{}", kind.slug()), &m.items);
+                        Msg::Library { kind, items: m.items }
                     }
                     Err(err) => Msg::LibraryFailed { kind, err },
                 }
@@ -313,6 +425,7 @@ impl App {
         std::thread::spawn(move || {
             match load_epg(&url) {
                 Ok(e) => {
+                    cache_write("epg", &e);
                     let _ = tx.send(Msg::Epg(e));
                 }
                 Err(e) => {
@@ -368,6 +481,7 @@ impl App {
                     self.show_settings = false;
                     self.form_msg.clear();
                     self.loaded = [false; 3];
+                    self.epoch += 1;
                     self.libs = [Arc::new(vec![]), Arc::new(vec![]), Arc::new(vec![])];
                     self.groups = [vec![], vec![], vec![]];
                     self.epg = Epg::default();
@@ -386,20 +500,40 @@ impl App {
                     self.form_busy = false;
                     self.form_msg = e;
                 }
-                Msg::Library { kind, items, fresh } => {
-                    if fresh {
-                        cache_write(&format!("lib-{}", kind.slug()), &items);
+                Msg::Library { kind, items } => self.set_library(kind, items),
+                Msg::Cached { epoch, kind, data } => {
+                    if epoch != self.epoch || self.loaded[kind.idx()] {
+                        continue;
                     }
-                    self.set_library(kind, items);
+                    let stale = match data {
+                        Some((ts, items)) => {
+                            self.set_library(kind, items);
+                            now_ms() - ts > 12 * 3600_000
+                        }
+                        None => true,
+                    };
+                    if stale && kind == Kind::Live && self.has_source() {
+                        self.refresh(kind);
+                    }
+                }
+                Msg::CachedEpg { epoch, data } => {
+                    if epoch != self.epoch {
+                        continue;
+                    }
+                    if let Some((ts, epg)) = data {
+                        if self.epg.programs.is_empty() {
+                            self.epg = epg;
+                        }
+                        if now_ms() - ts > 12 * 3600_000 && !self.src.epg.is_empty() {
+                            self.load_epg_url(self.src.epg.clone());
+                        }
+                    }
                 }
                 Msg::LibraryFailed { kind, err } => {
                     self.loading[kind.idx()] = false;
                     self.lib_err[kind.idx()] = Some(err);
                 }
-                Msg::Epg(e) => {
-                    cache_write("epg", &e);
-                    self.epg = e;
-                }
+                Msg::Epg(e) => self.epg = e,
                 Msg::ShortEpg { sid, progs } => {
                     self.short_pending.remove(&sid);
                     self.short_epg.insert(sid, progs);
@@ -442,6 +576,7 @@ impl App {
     pub fn recompute_view(&mut self) {
         let lib = self.libs[self.kind.idx()].clone();
         let terms: Vec<String> = self.query.to_lowercase().split_whitespace().map(String::from).collect();
+        let hide = |it: &Item| self.locked && is_adult(&it.group);
         let mut out: Vec<u32> = Vec::new();
         match &self.group {
             Group::Recent => {
@@ -452,19 +587,31 @@ impl App {
                         out.push(i as u32);
                     }
                 }
-                out.retain(|&i| terms.iter().all(|t| lib[i as usize].lc.contains(t.as_str())));
+                out.retain(|&i| terms.iter().all(|t| lib[i as usize].lc.contains(t.as_str())) && !hide(&lib[i as usize]));
             }
             g => {
-                for (i, it) in lib.iter().enumerate() {
-                    let ok = match g {
-                        Group::All => true,
-                        Group::Fav => self.favs.contains(&it.key()),
-                        Group::Named(n) => &it.group == n,
-                        Group::Recent => false,
-                    };
-                    if ok && terms.iter().all(|t| it.lc.contains(t.as_str())) {
-                        out.push(i as u32);
+                let pass = |fuzzy: bool| -> Vec<u32> {
+                    let mut v = Vec::new();
+                    for (i, it) in lib.iter().enumerate() {
+                        let ok = match g {
+                            Group::All => true,
+                            Group::Fav => self.favs.contains(&it.key()),
+                            Group::Named(n) => &it.group == n,
+                            Group::Recent => false,
+                        };
+                        if ok && !hide(it) && terms.iter().all(|t| if fuzzy { is_subsequence(&it.lc, t) } else { it.lc.contains(t.as_str()) }) {
+                            v.push(i as u32);
+                        }
                     }
+                    v
+                };
+                out = pass(false);
+                // Nothing matched exactly: fall back to a typo-tolerant search.
+                if out.is_empty() && self.query.trim().chars().count() >= 3 {
+                    out = pass(true);
+                }
+                if !terms.is_empty() {
+                    out.sort_by_key(|&i| search_rank(&lib[i as usize].lc, &terms));
                 }
             }
         }
@@ -517,6 +664,10 @@ impl App {
         let a = self.active;
         if let Some(m) = &self.slots[a].mpv {
             m.load(&url);
+            if self.speed != 1.0 {
+                m.set("speed", "1");
+                self.speed = 1.0;
+            }
         }
         self.slots[a].status = "Loading…".into();
         self.slots[a].stats = Stats::default();
@@ -532,7 +683,9 @@ impl App {
                 ctx.request_repaint();
             });
         }
-        self.slots[a].current = Some(Playing { item, kind, episodes, ep_idx, title, retried: false });
+        self.slots[a].current = Some(Playing { item, kind, episodes, ep_idx, title, retries: 0, retry_at: None });
+        self.slots[a].tracks.clear();
+        self.slots[a].resume_to = if kind != Kind::Live { self.settings.positions.get(&url).copied().filter(|p| *p > 10.0) } else { None };
         self.save_settings();
         self.ctx.request_repaint();
     }
@@ -580,6 +733,66 @@ impl App {
         }
     }
 
+    /// Play the nth (1-based) entry of the current list.
+    pub fn play_number(&mut self, n: usize) {
+        let lib = self.libs[self.kind.idx()].clone();
+        if let Some(it) = n.checked_sub(1).and_then(|i| self.view.get(i)).and_then(|&i| lib.get(i as usize)).map(|it| it.clone()) {
+            self.scroll_to = Some(n - 1);
+            self.open_item(&it);
+        }
+    }
+
+    /* ---------------- parental control ---------------- */
+
+    pub fn try_unlock(&mut self) {
+        if self.pin_input == self.settings.pin {
+            self.locked = false;
+            self.pin_msg.clear();
+            self.view_dirty = true;
+        } else {
+            self.pin_msg = "Wrong PIN".into();
+        }
+        self.pin_input.clear();
+    }
+
+    pub fn lock_now(&mut self) {
+        if self.settings.pin.is_empty() {
+            return;
+        }
+        self.locked = true;
+        self.view_dirty = true;
+        if matches!(&self.group, Group::Named(n) if is_adult(n)) {
+            self.group = Group::All;
+            self.browsing = true;
+        }
+        for i in 0..self.slots.len() {
+            if self.slots[i].current.as_ref().is_some_and(|c| is_adult(&c.item.group)) {
+                self.stop_slot(i);
+            }
+        }
+    }
+
+    pub fn set_pin(&mut self) {
+        let p = self.pin_input.trim().to_string();
+        if !(4..=8).contains(&p.len()) || !p.chars().all(|c| c.is_ascii_digit()) {
+            self.pin_msg = "PIN must be 4-8 digits".into();
+            return;
+        }
+        self.settings.pin = p;
+        self.locked = false;
+        self.pin_input.clear();
+        self.pin_msg = "PIN saved".into();
+        self.save_settings();
+    }
+
+    pub fn remove_pin(&mut self) {
+        self.settings.pin.clear();
+        self.locked = false;
+        self.pin_msg.clear();
+        self.view_dirty = true;
+        self.save_settings();
+    }
+
     pub fn stop(&mut self) {
         let s = &mut self.slots[self.active];
         if let Some(m) = &s.mpv {
@@ -588,6 +801,7 @@ impl App {
         s.current = None;
         s.status.clear();
         s.stats = Stats::default();
+        self.save_settings();
     }
 
     /// Enter or leave multi-view (several streams side by side).
@@ -597,8 +811,8 @@ impl App {
         }
         if on {
             let Some(pa) = self.proc_addr.clone() else { return };
-            while self.slots.len() < MAX_SLOTS {
-                match new_mpv(&pa, &self.ctx, self.volume, true) {
+            while self.slots.len() < self.multi_n {
+                match new_mpv(&pa, &self.ctx, self.volume, true, self.hwdec) {
                     Ok(m) => self.slots.push(Slot::new(Some(m))),
                     Err(e) => {
                         self.mpv_err = Some(e);
@@ -613,6 +827,36 @@ impl App {
             self.slots.push(keep);
             self.active = 0;
             self.multi = false;
+        }
+        self.apply_audio();
+        self.force_all_render();
+    }
+
+    /// Change the number of multi-view tiles while multi-view is on.
+    pub fn set_multi_count(&mut self, n: usize) {
+        let n = n.clamp(2, MAX_SLOTS);
+        self.multi_n = n;
+        if !self.multi {
+            return;
+        }
+        if let Some(pa) = self.proc_addr.clone() {
+            while self.slots.len() < n {
+                match new_mpv(&pa, &self.ctx, self.volume, true, self.hwdec) {
+                    Ok(m) => self.slots.push(Slot::new(Some(m))),
+                    Err(e) => {
+                        self.mpv_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        while self.slots.len() > n {
+            let last = self.slots.len() - 1;
+            if self.active == last {
+                self.slots.swap(last, 0);
+                self.active = 0;
+            }
+            self.slots.pop();
         }
         self.apply_audio();
         self.force_all_render();
@@ -661,11 +905,21 @@ impl App {
             let Some(m) = &s.mpv else { continue };
             let mut ended = false;
             let mut failed: Option<String> = None;
+            let mut loaded = false;
             for e in m.poll_events() {
                 match e {
-                    Event_::Loaded => s.status.clear(),
+                    Event_::Loaded => {
+                        s.status.clear();
+                        loaded = true;
+                    }
                     Event_::Ended => ended = true,
                     Event_::Failed(e) => failed = Some(e),
+                }
+            }
+            if loaded {
+                s.tracks = m.tracks();
+                if let Some(p) = s.resume_to.take() {
+                    m.command(&["seek", &p.to_string(), "absolute"]);
                 }
             }
             if s.current.is_some() && s.last_stats.elapsed().as_millis() > 100 {
@@ -682,6 +936,27 @@ impl App {
                 if s.stats.w > 0 && s.status == "Loading…" {
                     s.status.clear();
                 }
+                // Remember where movies / episodes were left off.
+                if let Some(c) = s.current.as_ref().filter(|c| c.kind != Kind::Live) {
+                    if s.stats.dur > 120.0 && s.resume_to.is_none() && !s.status.starts_with("Loading") {
+                        let url = c.episodes.as_ref().map(|e| e[c.ep_idx].url.clone()).unwrap_or_else(|| c.item.url.clone());
+                        if s.stats.pos >= s.stats.dur * 0.95 {
+                            self.settings.positions.remove(&url);
+                        } else if s.stats.pos > 10.0 && (s.stats.pos - self.settings.positions.get(&url).copied().unwrap_or(0.0)).abs() >= 5.0 {
+                            if self.settings.positions.len() > 300 {
+                                let drop: Vec<String> = self.settings.positions.keys().take(50).cloned().collect();
+                                drop.iter().for_each(|k| { self.settings.positions.remove(k); });
+                            }
+                            self.settings.positions.insert(url, s.stats.pos);
+                        }
+                    }
+                }
+                // A stream that has stayed up for a while is healthy again.
+                if s.stats.pos > 20.0 {
+                    if let Some(c) = s.current.as_mut() {
+                        c.retries = 0;
+                    }
+                }
             }
             if ended && s.current.as_ref().map(|c| c.episodes.is_some()).unwrap_or(false) {
                 let prev = std::mem::replace(&mut self.active, i);
@@ -689,17 +964,85 @@ impl App {
                 self.active = prev;
                 continue;
             }
-            if let Some(err) = failed {
-                let retry = s.current.as_mut().filter(|c| !c.retried && c.kind == Kind::Live).map(|c| {
-                    c.retried = true;
-                    c.item.url.clone()
-                });
-                match (retry, &s.mpv) {
-                    (Some(u), Some(m)) => m.load(&u),
-                    _ => s.status = format!("Cannot play this stream ({err})"),
+            // Live streams that drop or fail are retried with exponential backoff.
+            if failed.is_some() || ended {
+                if let Some(c) = s.current.as_mut().filter(|c| c.kind == Kind::Live && c.retry_at.is_none()) {
+                    if c.retries < MAX_RETRIES {
+                        c.retries += 1;
+                        c.retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1 << (c.retries - 1)));
+                        s.status = format!("Connection lost — reconnecting ({}/{MAX_RETRIES})…", c.retries);
+                    } else {
+                        s.status = format!("Cannot play this stream ({})", failed.as_deref().unwrap_or("stream ended"));
+                    }
+                } else if let Some(err) = &failed {
+                    if s.current.as_ref().map(|c| c.kind != Kind::Live).unwrap_or(false) {
+                        s.status = format!("Cannot play this stream ({err})");
+                    }
+                }
+            }
+            if let Some(c) = s.current.as_mut() {
+                if c.retry_at.is_some_and(|t| t <= std::time::Instant::now()) {
+                    c.retry_at = None;
+                    m.load(&c.item.url);
                 }
             }
         }
+    }
+
+    pub fn retry_now(&mut self) {
+        let s = &mut self.slots[self.active];
+        if let (Some(m), Some(c)) = (&s.mpv, s.current.as_mut()) {
+            c.retries = 0;
+            c.retry_at = None;
+            s.status = "Loading…".into();
+            m.load(&c.item.url);
+        }
+    }
+
+    pub fn set_audio_track(&mut self, id: i64) {
+        self.set_track("aid", id);
+    }
+
+    /// `id < 0` turns subtitles off.
+    pub fn set_sub_track(&mut self, id: i64) {
+        self.set_track("sid", id);
+    }
+
+    fn set_track(&mut self, prop: &str, id: i64) {
+        let s = &mut self.slots[self.active];
+        if let Some(m) = &s.mpv {
+            m.set(prop, &if id < 0 { "no".to_string() } else { id.to_string() });
+            s.tracks = m.tracks();
+        }
+    }
+
+    pub fn set_aspect(&mut self, i: usize) {
+        self.aspect = i;
+        let (_, ar, pan) = ASPECTS[i];
+        for s in &self.slots {
+            if let Some(m) = &s.mpv {
+                m.set("video-aspect-override", ar);
+                m.set("panscan", pan);
+            }
+        }
+        self.force_all_render();
+    }
+
+    pub fn set_speed(&mut self, v: f64) {
+        self.speed = v;
+        if let Some(m) = &self.cur().mpv {
+            m.set("speed", &v.to_string());
+        }
+    }
+
+    pub fn set_hwdec(&mut self, on: bool) {
+        self.hwdec = on;
+        for s in &self.slots {
+            if let Some(m) = &s.mpv {
+                m.set("hwdec", if on { "auto-safe" } else { "no" });
+            }
+        }
+        self.save_settings();
     }
 
     pub fn is_vod(&self) -> bool {
@@ -778,11 +1121,8 @@ impl App {
         let s = &mut self.slots[slot];
         let needs_new = s.video.as_ref().map(|v| v.w != px_w || v.h != px_h).unwrap_or(true);
         if needs_new {
-            unsafe {
-                if let Some(old) = s.video.take() {
-                    gl.delete_framebuffer(old.fbo);
-                    gl.delete_texture(old.tex);
-                }
+            let had_old = s.video.is_some();
+            let created = unsafe {
                 let tex = gl.create_texture().ok()?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, px_w, px_h, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
@@ -795,9 +1135,37 @@ impl App {
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 let id = frame.register_native_glow_texture(tex);
-                s.video = Some(VideoTex { fbo, tex, id, w: px_w, h: px_h });
+                VideoTex { fbo, tex, id, w: px_w, h: px_h }
+            };
+            // Render into the new texture first; keep showing the old (stretched) one until it has a real frame,
+            // otherwise a resize (e.g. toggling fullscreen) flashes black.
+            let ok = match &s.mpv {
+                Some(m) => {
+                    use glow::NativeFramebuffer;
+                    let NativeFramebuffer(n) = created.fbo;
+                    let r = m.render(n.get(), created.w, created.h, true);
+                    unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+                    r
+                }
+                None => true,
+            };
+            if ok || !had_old {
+                unsafe {
+                    if let Some(old) = s.video.take() {
+                        gl.delete_framebuffer(old.fbo);
+                        gl.delete_texture(old.tex);
+                    }
+                }
+                s.video = Some(created);
+                s.force_render = !ok;
+            } else {
+                unsafe {
+                    gl.delete_framebuffer(created.fbo);
+                    gl.delete_texture(created.tex);
+                }
+                self.ctx.request_repaint();
             }
-            s.force_render = true;
+            return s.video.as_ref().map(|v| v.id);
         }
         let v = s.video.as_ref()?;
         if let Some(m) = &s.mpv {

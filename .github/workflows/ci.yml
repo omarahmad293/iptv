@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # libmpv is loaded dynamically at runtime, so it is not needed to build or test.
+      - name: Test
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
